@@ -2276,6 +2276,7 @@ class BatchPrefillWithPagedKVCacheWrapper:
         self._block_tables = None
         self._cudnn_block_tables: Optional[torch.Tensor] = None
         self._cudnn_q_lens_buffer: Optional[torch.Tensor] = None
+        self._cudnn_qo_indptr_staging: Optional[torch.Tensor] = None
         self._cudnn_prepared: Optional[CudnnPrefillGraph] = None
         self._cudnn_plan: Optional[_CudnnPrefillPlan] = None
         # cuDNN < 9.27, single-token GQA batch with zero-length requests: the
@@ -2898,7 +2899,23 @@ class BatchPrefillWithPagedKVCacheWrapper:
                 # NOTE(Zihao): mask_indptr has the same length as qo_indptr
                 self._mask_indptr_buf.copy_(mask_indptr, non_blocking=non_blocking)
         else:
-            self._qo_indptr_buf = qo_indptr.to(self.device, non_blocking=non_blocking)
+            if self._backend == "cudnn":
+                # A captured cuDNN graph binds raw pointers to the token
+                # offsets, so replans must rewrite one wrapper-owned buffer
+                # instead of rebinding a freshly allocated (and soon reusable)
+                # tensor. The copy casts to the int32 cuDNN requires.
+                staging = self._cudnn_qo_indptr_staging
+                if staging is None or staging.shape != qo_indptr.shape:
+                    staging = torch.empty(
+                        qo_indptr.shape, device=self.device, dtype=torch.int32
+                    )
+                    self._cudnn_qo_indptr_staging = staging
+                staging.copy_(qo_indptr, non_blocking=non_blocking)
+                self._qo_indptr_buf = staging
+            else:
+                self._qo_indptr_buf = qo_indptr.to(
+                    self.device, non_blocking=non_blocking
+                )
             self._paged_kv_indptr_buf = paged_kv_indptr.to(
                 self.device, non_blocking=non_blocking
             )
